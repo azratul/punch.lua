@@ -19,7 +19,7 @@ Designed for LuaJIT scripts, automation tools, or **Neovim** plugins requiring s
 Install it directly via **LuaRocks**:
 
 ```bash
-luarocks install punch.lua
+luarocks install punch
 ```
 
 ### System Requirements
