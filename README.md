@@ -73,7 +73,6 @@ local s = p2p.start({
 - `punch/punch.lua`: UDP hole punching probe loop.
 - `punch/crypto.lua`: AES-GCM encryption and X25519 handshake.
 - `punch/ws.lua`: Minimal WebSocket client with TLS support.
-- `chat.lua`: Interactive P2P chat example application.
 
 ## Testing
 
