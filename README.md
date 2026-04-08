@@ -95,6 +95,3 @@ busted
 ## License
 
 This project is licensed under the **GNU GPLv3**. This ensures the software remains free, and any derivative works must also be open-sourced under the same license.
-
----
-Built with ❤️ by [azratul](https://github.com/azratul)
