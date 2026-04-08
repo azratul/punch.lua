@@ -1,0 +1,6 @@
+lua_modules/
+*.rock
+*.install
+*.swp
+*.swo
+*.log

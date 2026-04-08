@@ -1,0 +1,7 @@
+return {
+  default = {
+    lua     = "luajit",
+    pattern = "_spec",
+    lpath   = "./?.lua;./?/init.lua;;",
+  },
+}
