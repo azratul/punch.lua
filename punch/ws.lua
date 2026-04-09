@@ -1,9 +1,8 @@
 -- punch/ws.lua
 -- Minimal WebSocket client (RFC 6455).
 --
--- Supports ws:// and wss://.  TLS for wss:// is implemented via OpenSSL
--- memory BIOs (libssl) using LuaJIT FFI.  Falls back gracefully if libssl
--- is not found, with a clear error message.
+-- Supports ws:// and wss://.  TLS for wss:// is handled by punch.tls (OpenSSL
+-- memory BIOs).  Falls back gracefully if libssl is not found.
 --
 -- Works with vim.uv (Neovim) or luv (standalone).
 --
@@ -24,177 +23,9 @@ local M = {}
 local uv  = (vim and (vim.uv or vim.loop)) or require("luv")
 local bit = require("bit")
 local band, bxor = bit.band, bit.bxor
+local tls = require("punch.tls")
 
 local schedule = (vim and vim.schedule) or function(fn) fn() end
-
--- ── Optional TLS (wss://) via OpenSSL memory BIOs ────────────────────────────
---
--- Uses the same libssl that punch.crypto loads.  TLS state is managed outside
--- the uv event loop via two BIO_s_mem() objects:
---   rbio — we write incoming network bytes here; SSL reads plaintext from it
---   wbio — SSL writes TLS records here; we flush them out to the TCP socket
-
-local ffi_ok, _ffi = pcall(require, "ffi")
-local _ssl_lib      = nil  -- libssl handle; nil = TLS unavailable
-
-if ffi_ok then
-  pcall(function()
-    _ffi.cdef [[
-      typedef struct ssl_ctx_st   SSL_CTX;
-      typedef struct ssl_st       SSL;
-      typedef struct bio_st       BIO;
-      typedef struct bio_method_st BIO_METHOD;
-
-      const SSL_METHOD *TLS_client_method(void);
-      SSL_CTX  *SSL_CTX_new(const SSL_METHOD *method);
-      void      SSL_CTX_free(SSL_CTX *ctx);
-      SSL      *SSL_new(SSL_CTX *ctx);
-      void      SSL_free(SSL *ssl);
-
-      const BIO_METHOD *BIO_s_mem(void);
-      BIO  *BIO_new(const BIO_METHOD *type);
-      int   BIO_free(BIO *a);
-      int   BIO_read(BIO *b, void *data, int dlen);
-      int   BIO_write(BIO *b, const void *data, int len);
-      size_t BIO_ctrl_pending(BIO *b);
-
-      void  SSL_set_bio(SSL *s, BIO *rbio, BIO *wbio);
-      void  SSL_set_connect_state(SSL *s);
-      long  SSL_ctrl(SSL *ssl, int cmd, long larg, void *parg);
-      int   SSL_do_handshake(SSL *s);
-      int   SSL_get_error(SSL *s, int ret);
-      int   SSL_write(SSL *s, const void *buf, int num);
-      int   SSL_read(SSL *s, void *buf, int num);
-    ]]
-  end)  -- ignore "already declared" if loaded twice
-
-  for _, name in ipairs({ "libssl.so.3", "libssl.so.1.1", "libssl.so" }) do
-    local ok, l = pcall(_ffi.load, name)
-    if ok then _ssl_lib = l; break end
-  end
-end
-
-local _SSL_ERROR_WANT_READ         = 2
-local _SSL_ERROR_WANT_WRITE        = 3
-local _SSL_CTRL_SET_TLSEXT_HOSTNAME = 55
-local _TLSEXT_NAMETYPE_host_name   = 0
-
--- Wrap a connected uv.tcp in a TLS session, perform the async handshake,
--- then call back with a transparent "io" adapter that has the same API:
---   adapter:write(data), adapter:read_start(fn), adapter:read_stop(),
---   adapter:is_closing(), adapter:close()
-local function tls_wrap(tcp, host, callback)
-  if not _ssl_lib then
-    callback("wss:// requires libssl (OpenSSL ≥ 1.1) — install it or use ws://")
-    return
-  end
-
-  local ctx = _ssl_lib.SSL_CTX_new(_ssl_lib.TLS_client_method())
-  if ctx == nil then callback("SSL_CTX_new failed"); return end
-
-  local ssl = _ssl_lib.SSL_new(ctx)
-  _ssl_lib.SSL_CTX_free(ctx)  -- SSL holds its own ctx ref
-  if ssl == nil then callback("SSL_new failed"); return end
-
-  local rbio = _ssl_lib.BIO_new(_ssl_lib.BIO_s_mem())
-  local wbio = _ssl_lib.BIO_new(_ssl_lib.BIO_s_mem())
-  if rbio == nil or wbio == nil then
-    if rbio ~= nil then _ssl_lib.BIO_free(rbio) end
-    if wbio ~= nil then _ssl_lib.BIO_free(wbio) end
-    _ssl_lib.SSL_free(ssl); callback("BIO_new failed"); return
-  end
-
-  _ssl_lib.SSL_set_bio(ssl, rbio, wbio)   -- SSL now owns both BIOs
-  _ssl_lib.SSL_set_connect_state(ssl)
-  -- Set SNI so servers using virtual hosting respond with the right certificate.
-  _ssl_lib.SSL_ctrl(ssl, _SSL_CTRL_SET_TLSEXT_HOSTNAME,
-    _TLSEXT_NAMETYPE_host_name, _ffi.cast("void*", host))
-
-  -- Flush everything SSL has written to wbio out to the TCP socket.
-  local function flush_wbio()
-    local pending = _ssl_lib.BIO_ctrl_pending(wbio)
-    while pending > 0 do
-      local buf = _ffi.new("char[?]", pending)
-      local n   = _ssl_lib.BIO_read(wbio, buf, tonumber(pending))
-      if n > 0 then tcp:write(_ffi.string(buf, n)) end
-      pending = _ssl_lib.BIO_ctrl_pending(wbio)
-    end
-  end
-
-  -- ── Adapter object ────────────────────────────────────────────────────────
-  local adapter = { _ssl = ssl, _tcp = tcp, _closed = false }
-
-  function adapter:write(data)
-    if self._closed then return end
-    _ssl_lib.SSL_write(self._ssl, data, #data)
-    flush_wbio()
-  end
-
-  function adapter:read_start(fn)
-    tcp:read_start(function(rerr, chunk)
-      if self._closed then return end
-      if rerr or not chunk then
-        fn(rerr or "eof", nil); return
-      end
-      _ssl_lib.BIO_write(rbio, chunk, #chunk)
-      -- Drain all available plaintext.
-      local outbuf = _ffi.new("char[65536]")
-      while true do
-        local n = _ssl_lib.SSL_read(self._ssl, outbuf, 65536)
-        if n <= 0 then break end
-        fn(nil, _ffi.string(outbuf, n))
-      end
-    end)
-  end
-
-  function adapter:read_stop()  tcp:read_stop()  end
-  function adapter:is_closing() return tcp:is_closing() end
-
-  function adapter:close()
-    if self._closed then return end
-    self._closed = true
-    _ssl_lib.SSL_free(self._ssl)  -- also frees the BIOs (owned by SSL)
-    if not tcp:is_closing() then tcp:close() end
-  end
-
-  -- ── Async TLS handshake ───────────────────────────────────────────────────
-  local hs_done = false
-
-  local function pump()
-    flush_wbio()
-    local ret = _ssl_lib.SSL_do_handshake(ssl)
-    flush_wbio()
-    if ret == 1 then
-      hs_done = true
-      tcp:read_stop()
-      callback(nil, adapter)
-      return
-    end
-    local e = _ssl_lib.SSL_get_error(ssl, ret)
-    if e == _SSL_ERROR_WANT_READ then
-      -- waiting for server data — libuv will call us back via read_start
-    elseif e == _SSL_ERROR_WANT_WRITE then
-      pump()  -- already flushed above; retry immediately
-    else
-      tcp:read_stop()
-      _ssl_lib.SSL_free(ssl)
-      callback("TLS handshake failed: SSL_get_error=" .. e)
-    end
-  end
-
-  tcp:read_start(function(rerr, data)
-    if hs_done then return end
-    if rerr or not data then
-      _ssl_lib.SSL_free(ssl)
-      callback("TLS handshake TCP error: " .. tostring(rerr))
-      return
-    end
-    _ssl_lib.BIO_write(rbio, data, #data)
-    pump()
-  end)
-
-  pump()  -- ClientHello: sends TLS records before the server responds
-end
 
 -- ── Base64 (standard, for Sec-WebSocket-Key) ──────────────────────────────────
 
@@ -478,7 +309,7 @@ function M.connect(url, opts, callback)
       end
 
       if secure then
-        tls_wrap(tcp, host, function(terr, adapter)
+        tls.wrap(tcp, host, function(terr, adapter)
           if terr then
             schedule(function() callback(terr) end)
             return

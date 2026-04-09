@@ -42,6 +42,7 @@ local M = {}
 
 local uv       = (vim and (vim.uv or vim.loop)) or require("luv")
 local log      = require("punch.log")
+local tls      = require("punch.tls")
 local schedule = (vim and vim.schedule) or function(fn) fn() end
 
 local DEFAULT_TIMEOUT = 30000
@@ -216,8 +217,9 @@ function M.new(config)
     _srv         = nil,  -- self-reference for DELETE / handler
   }
 
+  local bind_host = config.host or "127.0.0.1"
   local tcp = uv.new_tcp()
-  local _, berr = tcp:bind("127.0.0.1", config.port or 0)
+  local _, berr = tcp:bind(bind_host, config.port or 0)
   if berr then
     tcp:close()
     return nil, "bind failed: " .. tostring(berr)
@@ -238,7 +240,7 @@ function M.new(config)
   local port = addr and addr.port or (config.port or 0)
 
   local srv = {
-    url = "http://127.0.0.1:" .. port,
+    url = "http://" .. bind_host .. ":" .. port,
     _tcp   = tcp,
     _state = state,
   }
@@ -278,19 +280,33 @@ end
 
 -- ── HTTP client helpers (guest side) ─────────────────────────────────────────
 
--- Parse "http://host:port" or "http://host" → host, port.
+-- Parse "http[s]://host[:port][/...]" → host, port, secure.
 local function parse_url(url)
-  local host, port_str = url:match("^https?://([^:/]+):(%d+)")
-  if host then return host, tonumber(port_str) end
-  host = url:match("^https?://([^/]+)")
-  return host, 80
+  local scheme, rest
+  if url:sub(1, 8) == "https://" then
+    scheme, rest = "https", url:sub(9)
+  elseif url:sub(1, 7) == "http://" then
+    scheme, rest = "http", url:sub(8)
+  else
+    return nil, nil, nil, "URL must start with http:// or https://"
+  end
+
+  -- Strip any path component — we only need host/port here.
+  local authority = rest:match("^([^/]+)") or rest
+  local host, port_str = authority:match("^(.+):(%d+)$")
+  if not host then
+    host     = authority
+    port_str = (scheme == "https") and "443" or "80"
+  end
+  return host, tonumber(port_str), (scheme == "https")
 end
 
--- Low-level: connect, send request, buffer response, call cb(err, status, slot, body).
+-- Low-level: connect (with optional TLS), send request, buffer response.
+-- Calls back(err, status_code, x_slot, body).
 local function http_req(method, url, path, body, timeout_ms, callback)
-  local host, port = parse_url(url)
+  local host, port, secure, perr = parse_url(url)
   if not host then
-    schedule(function() callback("invalid URL: " .. tostring(url)) end)
+    schedule(function() callback("invalid URL: " .. tostring(url) .. (perr and (" — " .. perr) or "")) end)
     return
   end
 
@@ -303,54 +319,76 @@ local function http_req(method, url, path, body, timeout_ms, callback)
     if done then return end
     done = true
     if timer and not timer:is_closing() then timer:close() end
-    if not tcp:is_closing() then
-      tcp:read_stop()
-      tcp:close()
-    end
     callback(err, code, slot, resp_body)
   end
 
   timer = uv.new_timer()
   timer:start(timeout_ms, 0, function()
+    if not tcp:is_closing() then tcp:read_stop(); tcp:close() end
     finish("HTTP request timed out after " .. timeout_ms .. " ms")
   end)
 
+  -- Build and send the HTTP request over `io` (plain tcp or TLS adapter).
+  local function do_request(io)
+    io:read_start(function(rerr, data)
+      if done then return end
+      if rerr then
+        io:close()
+        finish("read error: " .. tostring(rerr))
+        return
+      end
+      if not data then
+        io:close()
+        finish("connection closed before response")
+        return
+      end
+
+      buf = buf .. data
+      local code, slot, clen, body_off = parse_http_response(buf)
+      if not code then return end
+      if #buf < body_off + clen - 1 then return end
+
+      io:read_stop()
+      io:close()
+      local resp = clen > 0 and buf:sub(body_off, body_off + clen - 1) or ""
+      finish(nil, code, slot, resp)
+    end)
+
+    local req_hdrs = method .. " " .. path .. " HTTP/1.1\r\n" .. "Host: " .. host .. "\r\n"
+    if body and #body > 0 then
+      req_hdrs = req_hdrs .. "Content-Type: application/json\r\n" .. "Content-Length: " .. #body .. "\r\n"
+    end
+    io:write(req_hdrs .. "\r\n" .. (body or ""))
+  end
+
   uv.getaddrinfo(host, nil, { socktype = "stream" }, function(aerr, res)
+    if done then return end
     if aerr or not res or #res == 0 then
+      if not tcp:is_closing() then tcp:close() end
       finish("could not resolve '" .. host .. "': " .. tostring(aerr))
       return
     end
 
     tcp:connect(res[1].addr, port, function(cerr)
+      if done then return end
       if cerr then
+        tcp:close()
         finish("TCP connect failed: " .. tostring(cerr))
         return
       end
 
-      tcp:read_start(function(rerr, data)
-        if done then return end
-        if rerr then finish("read error: " .. tostring(rerr)); return end
-        if not data then finish("connection closed before response"); return end
-
-        buf = buf .. data
-        local code, slot, clen, body_off = parse_http_response(buf)
-        if not code then return end
-        if #buf < body_off + clen - 1 then return end
-
-        tcp:read_stop()
-        local resp = clen > 0 and buf:sub(body_off, body_off + clen - 1) or ""
-        finish(nil, code, slot, resp)
-      end)
-
-      -- Build and send the HTTP request.
-      local req_hdrs = method .. " " .. path .. " HTTP/1.1\r\n"
-                    .. "Host: " .. host .. "\r\n"
-      if body and #body > 0 then
-        req_hdrs = req_hdrs
-          .. "Content-Type: application/json\r\n"
-          .. "Content-Length: " .. #body .. "\r\n"
+      if secure then
+        tls.wrap(tcp, host, function(terr, adapter)
+          if done then return end
+          if terr then
+            finish("TLS error: " .. tostring(terr))
+            return
+          end
+          do_request(adapter)
+        end)
+      else
+        do_request(tcp)
       end
-      tcp:write(req_hdrs .. "\r\n" .. (body or ""))
     end)
   end)
 end

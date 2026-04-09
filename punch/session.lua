@@ -90,6 +90,7 @@ function M.new(config)
     _token         = nil,
     _ecdh          = nil,   -- { pub, priv } ephemeral X25519 keypair
     _timeout_timer = nil,
+    _winning_pair  = nil,   -- ICE pair that succeeded; nil until "open"
   }
 
   -- ── Event helpers ──────────────────────────────────────────────────────────
@@ -109,6 +110,7 @@ function M.new(config)
   end
 
   function self:_set_state(s)
+    local prev = self.state
     self.state = s
     -- Cancel the global timeout once we reach a terminal or success state.
     if (s == "open" or s == "closed") and self._timeout_timer then
@@ -116,6 +118,9 @@ function M.new(config)
         self._timeout_timer:close()
       end
       self._timeout_timer = nil
+    end
+    if s ~= prev then
+      schedule(function() self:_emit("state_change", s, prev) end)
     end
   end
 
@@ -264,13 +269,22 @@ function M.new(config)
 
   -- ── Connectivity checks ────────────────────────────────────────────────────
 
+  -- Return the ICE candidate pair that was selected when the session opened.
+  -- Returns nil if the session is not yet open or used a relay channel.
+  function self:get_selected_pair()
+    return self._winning_pair
+  end
+
   -- Helper: open a channel from a winning UDP pair.
   function self:_open_udp_channel(winning_pair, handle)
+    self._winning_pair = winning_pair
     local key = config.key or _derive_session_key(self)
 
     local ch = channel.new_udp(handle, winning_pair.remote_cand.addr,
       winning_pair.remote_cand.port,
-      { key = key, mode = "direct" })
+      { key = key, mode = "direct",
+        keepalive_interval = config.keepalive_interval,
+        peer_timeout       = config.peer_timeout })
 
     ch:on("data",  function(data) self:_emit("message", data) end)
     ch:on("close", function(reason)

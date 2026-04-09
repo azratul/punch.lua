@@ -18,7 +18,7 @@
 --   -- Gather local candidates (host + srflx) and bind the UDP socket.
 --   ice.gather(opts, callback)
 --     opts.port  — local UDP port (default: 0 = OS picks)
---     opts.stun  — STUN server "host:port"
+--     opts.stun  — STUN server "host:port" OR table of servers tried in order
 --     callback(err, local_candidates, handle)
 --       local_candidates — array of candidate tables
 --       handle           — the bound udp handle; caller owns it
@@ -113,6 +113,10 @@ end
 
 -- Gather local candidates by binding a UDP socket and querying STUN.
 --
+-- opts.stun may be a single "host:port" string or a table of servers tried in
+-- order.  The first server that responds is used; if all fail, only the host
+-- candidate is returned (no error).
+--
 -- callback(err, candidates, handle)
 function M.gather(opts, callback)
   opts = opts or {}
@@ -138,29 +142,48 @@ function M.gather(opts, callback)
     priority = candidate_priority("host"),
   }
 
-  if not opts.stun or opts.stun == "" or opts.stun == false then
+  -- Normalise opts.stun to a list (string → single-element list).
+  local stun_servers
+  if type(opts.stun) == "table" then
+    stun_servers = opts.stun
+  elseif opts.stun and opts.stun ~= "" and opts.stun ~= false then
+    stun_servers = { opts.stun }
+  else
+    stun_servers = {}
+  end
+
+  if #stun_servers == 0 then
     schedule(function() callback(nil, { host_cand }, handle) end)
     return
   end
 
-  -- Srflx candidate: public address via STUN (works for non-symmetric NAT).
-  stun.discover({ server = opts.stun, handle = handle }, function(serr, addr, port)
-    if serr then
-      -- STUN failed: return only the host candidate; direct LAN or relay may work.
+  -- Try each STUN server in order; use the first successful response.
+  local function try_stun(idx)
+    if idx > #stun_servers then
+      -- All servers failed: return host-only candidates.
       callback(nil, { host_cand }, handle)
       return
     end
 
-    local srflx_cand = {
-      type     = "srflx",
-      addr     = addr,
-      port     = port,
-      priority = candidate_priority("srflx"),
-    }
+    stun.discover({ server = stun_servers[idx], handle = handle },
+      function(serr, addr, port)
+        if serr or not addr then
+          try_stun(idx + 1)
+          return
+        end
 
-    -- srflx first (higher priority); host second
-    callback(nil, { srflx_cand, host_cand }, handle)
-  end)
+        local srflx_cand = {
+          type     = "srflx",
+          addr     = addr,
+          port     = port,
+          priority = candidate_priority("srflx"),
+        }
+        -- srflx first (higher priority); host second.
+        callback(nil, { srflx_cand, host_cand }, handle)
+      end)
+  end
+
+  try_stun(1)
 end
 
 -- Build candidate pairs from local and remote candidates, sorted by priority.

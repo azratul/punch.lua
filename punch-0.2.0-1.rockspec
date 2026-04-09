@@ -1,9 +1,9 @@
 package = "punch"
-version = "0.1.0-1"
+version = "0.2.0-1"
 
 source = {
   url = "git+https://github.com/azratul/punch.lua.git",
-  tag = "v0.1.0"
+  tag = "v0.2.0"
 }
 
 description = {
@@ -15,8 +15,9 @@ description = {
     ICE-style candidate pairs, and encrypts the channel with AES-256-GCM.
     Falls back to a relay broker when the NAT type prevents direct traversal.
     Includes a minimal HTTP signaling server for local description exchange.
+    HTTPS support for signaling server clients (via OpenSSL memory BIOs).
     Works with vim.uv (Neovim) or luv (standalone LuaJIT).
-    Requires OpenSSL installed on the system for encryption and WSS.
+    Requires OpenSSL installed on the system for encryption, HTTPS and WSS.
   ]],
   homepage = "https://github.com/azratul/punch.lua",
   license  = "GPL-3.0",
@@ -27,7 +28,7 @@ dependencies = {
   "luv",
 }
 
--- OpenSSL (libcrypto) is required for AES-256-GCM encryption and WSS relay
+-- OpenSSL (libcrypto + libssl) required for AES-256-GCM, HTTPS, and WSS
 external_dependencies = {
   OPENSSL = {
     library = "crypto"

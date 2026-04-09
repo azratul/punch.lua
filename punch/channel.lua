@@ -6,19 +6,39 @@
 -- to know whether the connection is direct or relayed, or whether encryption
 -- is active.
 --
--- Encryption: if a crypto context (key) is provided, every payload is
--- encrypted on send and decrypted on receive using AES-256-GCM.
+-- ── Wire format ───────────────────────────────────────────────────────────────
 --
--- UDP note: UDP is not reliable.  For the use cases this library targets
--- (collaborative text editing, cursor sharing) occasional packet loss is
--- acceptable.  If the application needs reliability, it should implement
--- its own sequence numbers and retransmission on top of channel:send().
+-- Every datagram (before optional AES-GCM encryption) carries a 1-byte frame
+-- type prefix:
+--
+--   \x01  data frame  — payload follows; forwarded to the application
+--   \x00  keepalive   — no payload; resets the dead-peer timer, not forwarded
+--
+-- The prefix is encrypted with the payload when a key is configured, so it is
+-- opaque to observers.  Two peers must run the same library version.
+--
+-- ── Keepalive and dead-peer detection (UDP channel only) ─────────────────────
+--
+-- The UDP channel fires a keepalive frame every `keepalive_interval` ms.  The
+-- same timer checks whether any packet has been received from the peer within
+-- `peer_timeout` ms; if not, the channel is closed with reason "peer timeout".
+-- Any packet from the peer (data or keepalive) resets the receive timestamp.
+--
+-- ── Payload limit ────────────────────────────────────────────────────────────
+--
+-- send() rejects payloads larger than MAX_PAYLOAD bytes to catch accidental
+-- misuse early.  The limit applies to the pre-encryption plaintext.
 --
 -- ── API ───────────────────────────────────────────────────────────────────────
 --
 --   ch = channel.new_udp(handle, peer_addr, peer_port, opts)
---     opts.key  — 32-byte AES key (nil = plaintext)
---     opts.mode — "direct" | "relay" (informational, default "direct")
+--     opts.key                — 32-byte AES key (nil = plaintext)
+--     opts.mode               — "direct" | "relay" (informational, default "direct")
+--     opts.keepalive_interval — ms between keepalives (default: 5000)
+--     opts.peer_timeout       — ms of silence before closing (default: 30000)
+--
+--   ch = channel.new_relay(relay_conn, opts)
+--     opts.key                — 32-byte AES key (nil = plaintext)
 --
 --   ch:send(payload)       — send a binary payload to the peer
 --   ch:on("data",  fn)     — fn(payload) on each incoming payload
@@ -29,16 +49,24 @@
 --   ch.peer_port           — remote port number
 local M = {}
 
-local crypto   = require("punch.crypto")
+local uv     = (vim and (vim.uv or vim.loop)) or require("luv")
+local crypto = require("punch.crypto")
 local schedule = (vim and vim.schedule) or function(fn) fn() end
+
+local MAX_PAYLOAD        = 65000  -- bytes; guard against accidental misuse
+local DEFAULT_KA_MS      = 5000   -- keepalive interval
+local DEFAULT_DEAD_MS    = 30000  -- dead-peer timeout
+
+local FRAME_DATA = "\x01"
+local FRAME_KA   = "\x00"
 
 -- ── Internal helpers ──────────────────────────────────────────────────────────
 
 local function new_channel(mode)
   return {
-    mode     = mode or "direct",
-    _cbs     = {},
-    _closed  = false,
+    mode    = mode or "direct",
+    _cbs    = {},
+    _closed = false,
   }
 end
 
@@ -57,33 +85,83 @@ end
 -- Create a channel over a connected (hole-punched) UDP handle.
 function M.new_udp(handle, peer_addr, peer_port, opts)
   opts = opts or {}
-  local key  = opts.key
-  local self = new_channel(opts.mode or "direct")
+  local key          = opts.key
+  local ka_interval  = opts.keepalive_interval or DEFAULT_KA_MS
+  local dead_timeout = opts.peer_timeout       or DEFAULT_DEAD_MS
+  local self         = new_channel(opts.mode or "direct")
 
-  self.peer_addr = peer_addr
-  self.peer_port = peer_port
-  self._handle   = handle
+  self.peer_addr  = peer_addr
+  self.peer_port  = peer_port
+  self._handle    = handle
+  self._last_recv = uv.now()  -- assume peer alive at creation
 
-  self.on    = ch_on
+  self.on = ch_on
+
+  local ka_timer = nil
+
+  local function stop_timer()
+    if ka_timer and not ka_timer:is_closing() then ka_timer:close() end
+    ka_timer = nil
+  end
+
+  local function do_close(reason)
+    if self._closed then return end
+    self._closed = true
+    stop_timer()
+    handle:recv_stop()
+    if not handle:is_closing() then handle:close() end
+    schedule(function() ch_emit(self, "close", reason) end)
+  end
+
+  -- Send a raw (already framed+encrypted) datagram to the peer.
+  local function raw_send(data)
+    handle:send(data, peer_addr, peer_port, function() end)
+  end
+
+  -- Build and send a keepalive frame.
+  local function send_keepalive()
+    if self._closed then return end
+    local data = FRAME_KA
+    if key then
+      local enc = crypto.encrypt(key, data)
+      if not enc then return end
+      data = enc
+    end
+    raw_send(data)
+  end
+
+  -- Start the combined keepalive + dead-peer timer.
+  ka_timer = uv.new_timer()
+  ka_timer:start(ka_interval, ka_interval, function()
+    if self._closed then return end
+    if uv.now() - self._last_recv >= dead_timeout then
+      do_close("peer timeout")
+      return
+    end
+    send_keepalive()
+  end)
+
   self.close = function(s)
-    if s._closed then return end
-    s._closed = true
-    s._handle:recv_stop()
-    if not s._handle:is_closing() then s._handle:close() end
+    do_close("closed by local peer")
   end
 
   self.send = function(s, payload)
     if s._closed then return end
-    local data = payload
+    if type(payload) ~= "string" then return end
+    if #payload > MAX_PAYLOAD then
+      do_close(string.format("payload too large: %d > %d bytes", #payload, MAX_PAYLOAD))
+      return
+    end
+    local data = FRAME_DATA .. payload
     if key then
-      local enc, err = crypto.encrypt(key, payload)
+      local enc, err = crypto.encrypt(key, data)
       if not enc then
-        schedule(function() ch_emit(s, "close", "encrypt error: " .. tostring(err)) end)
+        do_close("encrypt error: " .. tostring(err))
         return
       end
       data = enc
     end
-    s._handle:send(data, peer_addr, peer_port, function() end)
+    raw_send(data)
   end
 
   -- Start receiving.
@@ -91,15 +169,11 @@ function M.new_udp(handle, peer_addr, peer_port, opts)
     if self._closed then return end
 
     if err then
-      schedule(function()
-        self._closed = true
-        ch_emit(self, "close", err)
-      end)
+      do_close(err)
       return
     end
 
-    -- libuv fires the UDP recv callback with nil data as an internal
-    -- notification (e.g. zero-length datagram).  This is not EOF — ignore it.
+    -- libuv fires with nil data for zero-length datagrams — not EOF, ignore.
     if not data then return end
 
     -- Only accept traffic from the known peer.
@@ -109,14 +183,24 @@ function M.new_udp(handle, peer_addr, peer_port, opts)
       if src_addr ~= peer_addr then return end
     end
 
+    -- Any packet from peer resets the dead-peer clock.
+    self._last_recv = uv.now()
+
     local payload = data
     if key then
-      local dec, derr = crypto.decrypt(key, data)
-      if not dec then
-        -- Bad tag: drop silently (could be a stray packet or replay).
-        return
-      end
+      local dec = crypto.decrypt(key, data)
+      if not dec then return end  -- bad tag: drop silently (stray / replay)
       payload = dec
+    end
+
+    -- Parse frame type.
+    local ftype = payload:sub(1, 1)
+    if ftype == FRAME_KA then
+      return  -- keepalive: timer already reset above, nothing to deliver
+    elseif ftype == FRAME_DATA then
+      payload = payload:sub(2)
+    else
+      return  -- unknown frame type: drop
     end
 
     schedule(function() ch_emit(self, "data", payload) end)
@@ -129,13 +213,14 @@ end
 --
 -- Wraps a relay_conn (from relay.lua) with the same channel interface.
 -- The relay_conn must expose: send(data), on("data"/"close", fn), close().
+-- Keepalive is not needed here: the underlying WebSocket/TCP layer handles
+-- liveness.  The frame prefix is applied for consistency.
 
 function M.new_relay(relay_conn, opts)
   opts = opts or {}
   local key  = opts.key
   local self = new_channel("relay")
 
-  -- Expose peer info from the relay candidate if provided.
   self.peer_addr = opts.peer_addr or "relay"
   self.peer_port = opts.peer_port or 0
   self._relay    = relay_conn
@@ -144,11 +229,26 @@ function M.new_relay(relay_conn, opts)
 
   self.send = function(s, payload)
     if s._closed then return end
-    local data = payload
+    if type(payload) ~= "string" then return end
+    if #payload > MAX_PAYLOAD then
+      schedule(function()
+        if not s._closed then
+          s._closed = true
+          ch_emit(s, "close", string.format("payload too large: %d > %d bytes", #payload, MAX_PAYLOAD))
+        end
+      end)
+      return
+    end
+    local data = FRAME_DATA .. payload
     if key then
-      local enc, err = crypto.encrypt(key, payload)
+      local enc, err = crypto.encrypt(key, data)
       if not enc then
-        schedule(function() ch_emit(s, "close", "encrypt error: " .. tostring(err)) end)
+        schedule(function()
+          if not s._closed then
+            s._closed = true
+            ch_emit(s, "close", "encrypt error: " .. tostring(err))
+          end
+        end)
         return
       end
       data = enc
@@ -166,13 +266,20 @@ function M.new_relay(relay_conn, opts)
     if self._closed then return end
     local payload = data
     if key then
-      local dec, derr = crypto.decrypt(key, data)
-      if not dec then
-        -- Bad tag: drop silently.
-        return
-      end
+      local dec = crypto.decrypt(key, data)
+      if not dec then return end  -- bad tag: drop silently
       payload = dec
     end
+
+    local ftype = payload:sub(1, 1)
+    if ftype == FRAME_KA then
+      return  -- keepalive from relay peer: ignore
+    elseif ftype == FRAME_DATA then
+      payload = payload:sub(2)
+    else
+      return
+    end
+
     schedule(function() ch_emit(self, "data", payload) end)
   end)
 

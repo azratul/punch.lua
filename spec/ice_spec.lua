@@ -90,6 +90,19 @@ describe("ice", function()
     end)
   end)
 
+  -- ── check_pairs ───────────────────────────────────────────────────────────
+
+  describe("check_pairs", function()
+    it("calls back with error immediately on empty pair list", function()
+      local got_err
+      ice.check_pairs({}, {}, {}, function(err) got_err = err end)
+      assert.is_string(got_err, "expected error string for empty list")
+    end)
+
+    -- Full connectivity check tests (with a live event loop) are in
+    -- spec/integration/punch_loopback_spec.lua.
+  end)
+
   -- ── priority ordering ─────────────────────────────────────────────────────
 
   describe("priority ordering", function()

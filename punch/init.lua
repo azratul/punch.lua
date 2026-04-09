@@ -31,19 +31,23 @@
 --
 -- ── Config ────────────────────────────────────────────────────────────────────
 --
---   stun          — STUN server "host:port"         (default: stun.l.google.com:19302)
---   relay         — relay broker URL "ws://…"       (default: nil — no relay fallback)
---   relay_timeout — ms to wait for relay peer        (default: 30000)
---   key           — 32-byte AES-256 key              (default: auto-derived from tokens)
---   port          — local UDP port                   (default: 0 = OS picks)
---   probe         — { interval, timeout }             (defaults: 500 ms, 5000 ms)
---   timeout       — global session timeout in ms     (default: 0 = no limit)
+--   stun               — STUN server "host:port" OR table of servers tried in order
+--                        (default: stun.l.google.com:19302)
+--   relay              — relay broker URL "ws://…"  (default: nil — no relay fallback)
+--   relay_timeout      — ms to wait for relay peer   (default: 30000)
+--   key                — 32-byte AES-256 key         (default: auto-derived from tokens)
+--   port               — local UDP port              (default: 0 = OS picks)
+--   probe              — { interval, timeout }        (defaults: 500 ms, 5000 ms)
+--   timeout            — global session timeout in ms (default: 0 = no limit)
+--   keepalive_interval — ms between UDP keepalives   (default: 5000)
+--   peer_timeout       — ms of silence before close  (default: 30000)
 --
 -- ── Session object ────────────────────────────────────────────────────────────
 --
 --   s:get_local_description()      → string  (share with remote peer)
 --   s:set_remote_description(str)  — triggers connectivity checks
---   s:on(event, fn)                — "open" | "message" | "close" | "error"
+--   s:on(event, fn)                — "open" | "message" | "close" | "error" | "state_change"
+--   s:get_selected_pair()          → pair table | nil  (the winning ICE pair when open)
 --   s:send(data)                   — binary payload (valid only when open)
 --   s:close()                      — terminate the session
 --   s.state                        — "new"|"gathering"|"ready"|"connecting"|"open"|"closed"
