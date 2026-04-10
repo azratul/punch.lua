@@ -57,6 +57,15 @@ local schedule = function(fn) fn() end
 -- ── Module-level helpers ──────────────────────────────────────────────────────
 
 local function _random_token()
+  if crypto.available then
+    local bytes = crypto.random_bytes(8)
+    local t = {}
+    for i = 1, 8 do t[i] = string.format("%02x", bytes:byte(i)) end
+    return table.concat(t)
+  end
+  -- Fallback when OpenSSL is absent: combine time and clock sub-seconds to
+  -- reduce (but not eliminate) the chance of a collision.
+  math.randomseed(math.floor(os.time() * 1000 + os.clock() * 1e6) % 0x7fffffff)
   local t = {}
   for i = 1, 8 do t[i] = string.format("%02x", math.random(0, 255)) end
   return table.concat(t)

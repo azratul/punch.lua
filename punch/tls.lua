@@ -23,6 +23,7 @@ local ssl_lib     = nil
 if ffi_ok then
   pcall(function()
     ffi.cdef [[
+      typedef struct ssl_method_st SSL_METHOD;
       typedef struct ssl_ctx_st    SSL_CTX;
       typedef struct ssl_st        SSL;
       typedef struct bio_st        BIO;
@@ -143,6 +144,7 @@ function M.wrap(tcp, host, callback)
         local n = ssl_lib.SSL_read(self._ssl, outbuf, 65536)
         if n <= 0 then break end
         fn(nil, ffi.string(outbuf, n))
+        if self._closed then break end  -- fn may have closed the adapter (SSL_free'd)
       end
     end)
   end
@@ -159,6 +161,7 @@ function M.wrap(tcp, host, callback)
     if self._closed then return end
     self._closed = true
     ssl_lib.SSL_free(self._ssl) -- also frees the BIOs (owned by SSL)
+    self._ssl = nil              -- prevent use-after-free if JIT caches the pointer
     if not tcp:is_closing() then tcp:close() end
   end
 
