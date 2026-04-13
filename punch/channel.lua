@@ -36,9 +36,11 @@
 --     opts.mode               — "direct" | "relay" (informational, default "direct")
 --     opts.keepalive_interval — ms between keepalives (default: 5000)
 --     opts.peer_timeout       — ms of silence before closing (default: 30000)
+--     opts.max_payload        — max plaintext bytes per send() call (default: 65000)
 --
 --   ch = channel.new_relay(relay_conn, opts)
 --     opts.key                — 32-byte AES key (nil = plaintext)
+--     opts.max_payload        — max plaintext bytes per send() call (default: 65000)
 --
 --   ch:send(payload)       — send a binary payload to the peer
 --   ch:on("data",  fn)     — fn(payload) on each incoming payload
@@ -88,6 +90,7 @@ function M.new_udp(handle, peer_addr, peer_port, opts)
   local key          = opts.key
   local ka_interval  = opts.keepalive_interval or DEFAULT_KA_MS
   local dead_timeout = opts.peer_timeout       or DEFAULT_DEAD_MS
+  local max_payload  = opts.max_payload        or MAX_PAYLOAD
   local self         = new_channel(opts.mode or "direct")
 
   self.peer_addr  = peer_addr
@@ -148,8 +151,8 @@ function M.new_udp(handle, peer_addr, peer_port, opts)
   self.send = function(s, payload)
     if s._closed then return end
     if type(payload) ~= "string" then return end
-    if #payload > MAX_PAYLOAD then
-      do_close(string.format("payload too large: %d > %d bytes", #payload, MAX_PAYLOAD))
+    if #payload > max_payload then
+      do_close(string.format("payload too large: %d > %d bytes", #payload, max_payload))
       return
     end
     local data = FRAME_DATA .. payload
@@ -218,8 +221,9 @@ end
 
 function M.new_relay(relay_conn, opts)
   opts = opts or {}
-  local key  = opts.key
-  local self = new_channel("relay")
+  local key         = opts.key
+  local max_payload = opts.max_payload or MAX_PAYLOAD
+  local self        = new_channel("relay")
 
   self.peer_addr = opts.peer_addr or "relay"
   self.peer_port = opts.peer_port or 0
@@ -230,11 +234,11 @@ function M.new_relay(relay_conn, opts)
   self.send = function(s, payload)
     if s._closed then return end
     if type(payload) ~= "string" then return end
-    if #payload > MAX_PAYLOAD then
+    if #payload > max_payload then
       schedule(function()
         if not s._closed then
           s._closed = true
-          ch_emit(s, "close", string.format("payload too large: %d > %d bytes", #payload, MAX_PAYLOAD))
+          ch_emit(s, "close", string.format("payload too large: %d > %d bytes", #payload, max_payload))
         end
       end)
       return

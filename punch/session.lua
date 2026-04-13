@@ -29,6 +29,7 @@
 --     config.port          — local UDP port (default: 0 = OS picks)
 --     config.probe         — opts passed to punch.probe (interval, timeout)
 --     config.timeout       — global session timeout in ms (0 / nil = no limit)
+--     config.max_payload   — max bytes per send() call (default: 65000)
 --
 --   s:gather([callback])         — gather candidates; callback(err)
 --   s:get_local_description()    → string | nil, err
@@ -293,7 +294,8 @@ function M.new(config)
       winning_pair.remote_cand.port,
       { key = key, mode = "direct",
         keepalive_interval = config.keepalive_interval,
-        peer_timeout       = config.peer_timeout })
+        peer_timeout       = config.peer_timeout,
+        max_payload        = config.max_payload })
 
     ch:on("data",  function(data) self:_emit("message", data) end)
     ch:on("close", function(reason)
@@ -347,7 +349,7 @@ function M.new(config)
 
         local key = config.key or _derive_session_key(self)
 
-        local ch = channel.new_relay(relay_conn, { key = key })
+        local ch = channel.new_relay(relay_conn, { key = key, max_payload = config.max_payload })
 
         ch:on("data",  function(data) self:_emit("message", data) end)
         ch:on("close", function(reason)
