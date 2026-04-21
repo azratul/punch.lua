@@ -41,12 +41,270 @@
 local M = {}
 
 local uv       = (vim and (vim.uv or vim.loop)) or require("luv")
+local bit      = require("bit")
 local log      = require("punch.log")
 local tls      = require("punch.tls")
 local schedule = (vim and vim.schedule) or function(fn) fn() end
 
 local DEFAULT_TIMEOUT = 30000
 local MAX_REQUEST     = 65536   -- hard cap: descriptions are ~500 bytes
+
+-- ── SHA-1 (pure Lua, for WebSocket Sec-WebSocket-Accept) ─────────────────────
+
+local function sha1(msg)
+  local band, bor, bxor, bnot = bit.band, bit.bor, bit.bxor, bit.bnot
+  local lshift, rol            = bit.lshift, bit.rol
+  local function u32(n) return band(n, 0xFFFFFFFF) end
+
+  local len = #msg
+  msg = msg .. "\x80"
+  while #msg % 64 ~= 56 do msg = msg .. "\x00" end
+  local bl = len * 8
+  msg = msg .. string.char(0, 0, 0, 0,
+    math.floor(bl / 0x1000000) % 256,
+    math.floor(bl / 0x10000)   % 256,
+    math.floor(bl / 0x100)     % 256,
+    bl % 256)
+
+  local h0, h1, h2, h3, h4 =
+    0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0
+
+  for i = 1, #msg, 64 do
+    local w = {}
+    for j = 0, 15 do
+      local o = i + j * 4
+      w[j] = u32(bor(lshift(msg:byte(o), 24), lshift(msg:byte(o + 1), 16),
+                     lshift(msg:byte(o + 2), 8), msg:byte(o + 3)))
+    end
+    for j = 16, 79 do
+      w[j] = rol(bxor(w[j - 3], w[j - 8], w[j - 14], w[j - 16]), 1)
+    end
+
+    local a, b, c, d, e = h0, h1, h2, h3, h4
+    for j = 0, 79 do
+      local f, k
+      if j < 20 then
+        f = bor(band(b, c), band(bnot(b), d)); k = 0x5A827999
+      elseif j < 40 then
+        f = bxor(b, c, d); k = 0x6ED9EBA1
+      elseif j < 60 then
+        f = bor(band(b, c), band(b, d), band(c, d)); k = 0x8F1BBCDC
+      else
+        f = bxor(b, c, d); k = 0xCA62C1D6
+      end
+      local t = u32(rol(a, 5) + f + e + k + w[j])
+      e = d; d = c; c = rol(b, 30); b = a; a = t
+    end
+    h0 = u32(h0 + a); h1 = u32(h1 + b); h2 = u32(h2 + c)
+    h3 = u32(h3 + d); h4 = u32(h4 + e)
+  end
+
+  local function b4(n)
+    return string.char(
+      math.floor(n / 0x1000000) % 256, math.floor(n / 0x10000) % 256,
+      math.floor(n / 0x100) % 256,     n % 256)
+  end
+  return b4(h0) .. b4(h1) .. b4(h2) .. b4(h3) .. b4(h4)
+end
+
+-- ── Base64 (standard alphabet, for Sec-WebSocket-Accept) ─────────────────────
+
+local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+local function b64_encode(s)
+  local res, i = {}, 1
+  while i <= #s do
+    local b1, b2, b3 = s:byte(i), s:byte(i + 1) or 0, s:byte(i + 2) or 0
+    local n = b1 * 65536 + b2 * 256 + b3
+    res[#res + 1] = B64:sub(math.floor(n / 262144) + 1,    math.floor(n / 262144) + 1)
+    res[#res + 1] = B64:sub(math.floor(n / 4096) % 64 + 1, math.floor(n / 4096) % 64 + 1)
+    res[#res + 1] = i + 1 <= #s and B64:sub(math.floor(n / 64) % 64 + 1, math.floor(n / 64) % 64 + 1) or "="
+    res[#res + 1] = i + 2 <= #s and B64:sub(n % 64 + 1, n % 64 + 1) or "="
+    i = i + 3
+  end
+  return table.concat(res)
+end
+
+local WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+local function ws_accept_key(client_key)
+  return b64_encode(sha1(client_key .. WS_GUID))
+end
+
+-- ── WebSocket server-side framing ─────────────────────────────────────────────
+-- Server → client frames are unmasked (RFC 6455 §5.1).
+
+local function ws_encode_server(payload, opcode)
+  opcode = opcode or 2
+  local len   = #payload
+  local first = 0x80 + opcode
+  local header
+  if len < 126 then
+    header = string.char(first, len)
+  elseif len < 65536 then
+    header = string.char(first, 126, math.floor(len / 256), len % 256)
+  else
+    header = string.char(first, 127, 0, 0, 0, 0,
+      math.floor(len / 0x1000000) % 256, math.floor(len / 0x10000) % 256,
+      math.floor(len / 0x100) % 256,     len % 256)
+  end
+  return header .. payload
+end
+
+-- Client → server frames are masked; this reader handles both masked and unmasked.
+local function new_ws_frame_reader()
+  local buf = ""
+  return function(data)
+    buf = buf .. data
+    local frames = {}
+    while true do
+      if #buf < 2 then break end
+      local b1, b2 = buf:byte(1), buf:byte(2)
+      local opcode = bit.band(b1, 0x0F)
+      local masked = bit.band(b2, 0x80) ~= 0
+      local plen7  = bit.band(b2, 0x7F)
+      local ext    = (plen7 == 126) and 2 or (plen7 == 127) and 8 or 0
+      local hdr    = 2 + ext + (masked and 4 or 0)
+      if #buf < hdr then break end
+
+      local plen
+      if     plen7 < 126  then plen = plen7
+      elseif plen7 == 126 then plen = buf:byte(3) * 256 + buf:byte(4)
+      else
+        plen = buf:byte(7) * 16777216 + buf:byte(8) * 65536
+             + buf:byte(9) * 256      + buf:byte(10)
+      end
+      if #buf < hdr + plen then break end
+
+      local payload = buf:sub(hdr + 1, hdr + plen)
+      if masked then
+        local mp  = 2 + ext + 1
+        local mk  = { buf:byte(mp, mp + 3) }
+        local out = {}
+        for i = 1, plen do
+          out[i] = string.char(bit.bxor(payload:byte(i), mk[(i - 1) % 4 + 1]))
+        end
+        payload = table.concat(out)
+      end
+      buf = buf:sub(hdr + plen + 1)
+
+      if     opcode == 1 then frames[#frames + 1] = { opcode = "text",   data = payload }
+      elseif opcode == 2 then frames[#frames + 1] = { opcode = "binary", data = payload }
+      elseif opcode == 8 then frames[#frames + 1] = { opcode = "close",  data = payload }
+      end
+    end
+    return frames
+  end
+end
+
+-- ── WebSocket relay broker ────────────────────────────────────────────────────
+--
+-- Endpoint: GET /relay  (with Upgrade: websocket)
+--
+-- Protocol (same as relay.lua client expects):
+--   peer → broker : TEXT  {"join":"<relay_token>"}
+--   broker → peer : TEXT  {"ready":true}    (once both peers have joined)
+--   broker → peer : TEXT  {"error":"<msg>"} (on failure)
+--   peer → broker : BINARY (data frame)     forwarded opaque to the other peer
+--   peer → broker : TEXT  {"leave":true}    graceful disconnect
+--
+-- The broker is token-matched: two peers with the same relay_token are paired.
+-- All data frames are forwarded without inspection (already AES-GCM encrypted
+-- by channel.lua on both ends).
+
+local function handle_ws_relay(client, state, ws_key)
+  client:write(
+    "HTTP/1.1 101 Switching Protocols\r\n" ..
+    "Upgrade: websocket\r\n" ..
+    "Connection: Upgrade\r\n" ..
+    "Sec-WebSocket-Accept: " .. ws_accept_key(ws_key) .. "\r\n\r\n"
+  )
+
+  local reader   = new_ws_frame_reader()
+  local my_token = nil
+  local room_ref = {}  -- room_ref[1] set once this peer is paired
+  local closed   = false
+
+  local function send_text(s)
+    if not client:is_closing() then
+      client:write(ws_encode_server(s, 1))
+    end
+  end
+
+  local function send_binary(s)
+    if not client:is_closing() then
+      client:write(ws_encode_server(s, 2))
+    end
+  end
+
+  local function on_close()
+    if closed then return end
+    closed = true
+    if my_token and not room_ref[1] then
+      state.relay_rooms[my_token] = nil
+    end
+    local room = room_ref[1]
+    if room then
+      local other = (room.a_client == client) and room.b_client or room.a_client
+      if other and not other:is_closing() then other:close() end
+    end
+    if not client:is_closing() then client:close() end
+  end
+
+  local function process(data)
+    for _, f in ipairs(reader(data)) do
+      if f.opcode == "close" then
+        on_close(); return
+
+      elseif f.opcode == "binary" then
+        local room = room_ref[1]
+        if room then
+          local fwd = (room.a_client == client) and room.b_send or room.a_send
+          fwd(f.data)
+        end
+
+      elseif f.opcode == "text" then
+        if f.data:find('"leave"', 1, true) then
+          on_close(); return
+        end
+        if not my_token then
+          local t = f.data:match('"join"%s*:%s*"([^"]*)"')
+          if not t or t == "" then
+            send_text('{"error":"expected join message with relay_token"}')
+            on_close(); return
+          end
+          my_token = t
+          local entry = state.relay_rooms[t]
+          if not entry then
+            state.relay_rooms[t] = {
+              a_send_text   = send_text,
+              a_send_binary = send_binary,
+              a_client      = client,
+              a_room_ref    = room_ref,
+            }
+          else
+            state.relay_rooms[t] = nil
+            local room = {
+              a_send   = entry.a_send_binary,
+              a_client = entry.a_client,
+              b_send   = send_binary,
+              b_client = client,
+            }
+            entry.a_room_ref[1] = room
+            room_ref[1]         = room
+            entry.a_send_text('{"ready":true}')
+            send_text('{"ready":true}')
+          end
+        end
+      end
+    end
+  end
+
+  client:read_start(function(rerr, data)
+    if rerr or not data then on_close(); return end
+    process(data)
+  end)
+end
 
 -- ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -128,6 +386,23 @@ local function handle_connection(client, state, timeout_ms)
     local body = clen > 0 and buf:sub(body_off, body_off + clen - 1) or ""
 
     log.debug("signaling: %s %s (%d body bytes)", method, path, #body)
+
+    -- ── GET /relay ── WebSocket relay broker ─────────────────────────────────
+    if method == "GET" and path == "/relay" then
+      if state.stopped then err_resp(client, 503, "server stopped"); return end
+      local buf_lower = buf:lower()
+      if not buf_lower:find("upgrade:%s*websocket", 1, false) then
+        err_resp(client, 426, "upgrade required")
+        return
+      end
+      local ws_key = buf:match("[Ss]ec%-[Ww]eb[Ss]ocket%-[Kk]ey:%s*([A-Za-z0-9+/=]+)")
+      if not ws_key then
+        err_resp(client, 400, "missing Sec-WebSocket-Key")
+        return
+      end
+      handle_ws_relay(client, state, ws_key)
+      return
+    end
 
     -- ── GET /desc/host ── assign slot, return host desc (long-poll) ──────────
     if method == "GET" and path == "/desc/host" then
@@ -214,6 +489,7 @@ function M.new(config)
     slots        = {},   -- slot_id → { desc = str | nil }
     guest_cb     = nil,  -- fn(slot, desc_str)
     stopped      = false,
+    relay_rooms  = {},   -- token → { a_send_text, a_send_binary, a_client, a_room_ref }
     _srv         = nil,  -- self-reference for DELETE / handler
   }
 
@@ -270,8 +546,14 @@ function M.new(config)
     local waiters = state.host_waiters
     state.host_waiters = {}
     for _, deliver in ipairs(waiters) do deliver(nil) end
-    state.slots     = {}
-    state.guest_cb  = nil
+    for _, entry in pairs(state.relay_rooms) do
+      if entry.a_client and not entry.a_client:is_closing() then
+        entry.a_client:close()
+      end
+    end
+    state.relay_rooms = {}
+    state.slots       = {}
+    state.guest_cb    = nil
   end
 
   log.debug("signaling server listening on %s", srv.url)

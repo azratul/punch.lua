@@ -197,10 +197,22 @@ function M.new(config)
         self._handle      = handle
         self:_set_state("ready")
 
+        -- Build description candidates: ICE candidates + relay candidate if configured.
+        -- relay_cands is separate from _local_cands so ice.make_pairs() ignores relay entries.
+        local desc_cands = cands
+        if config.relay then
+          desc_cands = {}
+          for _, c in ipairs(cands) do desc_cands[#desc_cands + 1] = c end
+          local relay_token = relay_m.make_token()
+          self._relay_token = relay_token
+          local relay_cand  = relay_m.make_candidate(config.relay, relay_token)
+          if relay_cand then desc_cands[#desc_cands + 1] = relay_cand end
+        end
+
         -- Pre-build the local description string (include ECDH public key if available).
         local desc_table = {
           token      = self._token,
-          candidates = cands,
+          candidates = desc_cands,
           pub        = self._ecdh and crypto.b64_encode(self._ecdh.pub) or nil,
         }
         local str, serr  = signal.encode(desc_table)
@@ -310,12 +322,16 @@ function M.new(config)
 
   -- Helper: attempt relay fallback after all direct pairs fail.
   function self:_try_relay(direct_err)
-    local relay_url   = config.relay
-    local relay_token
-    for _, c in ipairs(self._remote_desc and self._remote_desc.candidates or {}) do
-      if c.type == "relay" and c.relay_token then
-        relay_token = c.relay_token
-        break
+    local relay_url = config.relay
+    -- Own token is used when this peer generated it (host side).
+    -- Otherwise extract from the remote description (guest side).
+    local relay_token = self._relay_token
+    if not relay_token then
+      for _, c in ipairs(self._remote_desc and self._remote_desc.candidates or {}) do
+        if c.type == "relay" and c.relay_token then
+          relay_token = c.relay_token
+          break
+        end
       end
     end
 

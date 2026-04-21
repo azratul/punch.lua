@@ -210,21 +210,18 @@ local function do_ws_upgrade(io, host, path, opts, callback)
   local reader = new_frame_reader()
   local conn   = new_conn(io)
 
-  local extra = ""
-  for k, v in pairs(opts.headers or {}) do
-    extra = extra .. k .. ": " .. v .. "\r\n"
-  end
-
-  io:write(table.concat({
+  local lines = {
     "GET " .. path .. " HTTP/1.1",
     "Host: " .. host,
     "Upgrade: websocket",
     "Connection: Upgrade",
     "Sec-WebSocket-Key: " .. ws_key,
     "Sec-WebSocket-Version: 13",
-    extra,
-    "\r\n",
-  }, "\r\n"))
+  }
+  for k, v in pairs(opts.headers or {}) do
+    lines[#lines + 1] = k .. ": " .. v
+  end
+  io:write(table.concat(lines, "\r\n") .. "\r\n\r\n")
 
   io:read_start(function(rerr, data)
     if rerr or not data then
