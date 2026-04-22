@@ -1,8 +1,18 @@
 # Changelog
 
+---
+
 ## [0.3.1] - 2026-04-22
 
 ### Fixed
+- `signal.encode`: host description now includes a top-level `rt` field (the relay
+  token) in addition to the relay candidate entry. `signal.decode` exposes it as
+  `desc.relay_token`. This gives consumers a direct lookup path and provides a
+  compatibility shim if the relay candidate type check ever fails.
+- `session._try_relay`: relay consumer now reads `self._remote_desc.relay_token`
+  first before falling back to scanning candidates, making relay token lookup more
+  robust and backward-compatible with older peers that only embed the token in a
+  relay candidate.
 - `session`: relay consumer peers (`relay_is_consumer = true`) no longer generate
   their own relay token/candidate during `gather()`. `_try_relay` now reads the
   broker owner's token from the remote description for these peers, ensuring both
