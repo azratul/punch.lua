@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.1] - 2026-04-22
+
+### Fixed
+- `session`: relay consumer peers (`relay_is_consumer = true`) no longer generate
+  their own relay token/candidate during `gather()`. `_try_relay` now reads the
+  broker owner's token from the remote description for these peers, ensuring both
+  sides join the same relay room. Previously both peers used independent tokens and
+  never paired at the broker.
+- `relay.make_candidate`: port is now correctly extracted from URLs that include a
+  path component (e.g. `ws://host:PORT/relay`). The previous `:(%d+)$` regex failed
+  because the string ended with `/relay`, not a digit, so port always fell back to 80.
+
+---
+
 ## [0.3.0] - 2026-04-21
 
 ### Added

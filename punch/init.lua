@@ -64,6 +64,8 @@
 --   require("punch.relay")    — relay fallback (stub)
 local M = {}
 
+M.version = "0.3.1"
+
 -- Seed the random number generator.
 math.randomseed(os.time() + (tonumber(tostring({}):match("0x%x+")) or 0))
 
@@ -77,18 +79,18 @@ local session = require("punch.session")
 --
 -- Returns the session object immediately (gathering is async).
 function M.start(config)
-  local s = session.new(config)
-  s:gather()  -- fire and forget; errors surface via on("error")
-  return s
+	local s = session.new(config)
+	s:gather() -- fire and forget; errors surface via on("error")
+	return s
 end
 
 -- Expose low-level modules for advanced use.
 M.session = session
-M.ice     = require("punch.ice")
-M.stun    = require("punch.stun")
-M.signal  = require("punch.signal")
+M.ice = require("punch.ice")
+M.stun = require("punch.stun")
+M.signal = require("punch.signal")
 M.channel = require("punch.channel")
-M.crypto  = require("punch.crypto")
-M.relay   = require("punch.relay")
+M.crypto = require("punch.crypto")
+M.relay = require("punch.relay")
 
 return M
