@@ -14,6 +14,7 @@
 --     v          = 1,             -- protocol version
 --     token      = "hex16chars",  -- random session identifier
 --     pub        = "base64(32b)", -- X25519 ECDH public key (optional; enables ECDH)
+--     rt         = "hex16chars",  -- relay_token (top-level, same as relay candidate rt)
 --     candidates = {
 --       { t = "host",  a = "192.168.1.5",   p = 54321 },
 --       { t = "srflx", a = "203.0.113.5",   p = 54321 },
@@ -180,7 +181,8 @@ function M.encode(desc)
       return out
     end)(),
   }
-  if desc.pub then wire.pub = desc.pub end  -- X25519 public key (base64, optional)
+  if desc.pub then wire.pub = desc.pub end               -- X25519 public key (base64, optional)
+  if desc.relay_token then wire.rt = desc.relay_token end -- top-level relay token for easy lookup
   local ok, result = pcall(_encode, wire)
   if not ok then return nil, tostring(result) end
   return result
@@ -216,10 +218,11 @@ function M.decode(str)
   end
 
   return {
-    version    = raw.v,
-    token      = raw.token or "",
-    pub        = (type(raw.pub) == "string" and raw.pub ~= "") and raw.pub or nil,
-    candidates = candidates,
+    version     = raw.v,
+    token       = raw.token or "",
+    pub         = (type(raw.pub) == "string" and raw.pub ~= "") and raw.pub or nil,
+    candidates  = candidates,
+    relay_token = (type(raw.rt) == "string" and raw.rt ~= "") and raw.rt or nil,
   }
 end
 

@@ -235,10 +235,12 @@ function M.new(config)
 			end
 
 			-- Pre-build the local description string (include ECDH public key if available).
+			-- relay_token at top level mirrors the relay candidate's token for easy lookup.
 			local desc_table = {
 				token = self._token,
 				candidates = desc_cands,
 				pub = self._ecdh and crypto.b64_encode(self._ecdh.pub) or nil,
+				relay_token = self._relay_token,
 			}
 			local str, serr = signal.encode(desc_table)
 			if not str then
@@ -369,10 +371,15 @@ function M.new(config)
 		-- Default (broker owner): use own generated relay_token.
 		local relay_token
 		if config.relay_is_consumer then
-			for _, c in ipairs(self._remote_desc and self._remote_desc.candidates or {}) do
-				if c.type == "relay" and c.relay_token then
-					relay_token = c.relay_token
-					break
+			-- Try top-level field first (set by hosts that encode relay_token in signal.encode).
+			relay_token = self._remote_desc and self._remote_desc.relay_token
+			-- Fallback: search candidates (compatibility with older hosts).
+			if not relay_token then
+				for _, c in ipairs(self._remote_desc and self._remote_desc.candidates or {}) do
+					if c.type == "relay" and c.relay_token then
+						relay_token = c.relay_token
+						break
+					end
 				end
 			end
 		else
