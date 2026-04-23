@@ -1,9 +1,9 @@
 package = "punch"
-version = "0.3.1-1"
+version = "0.3.2-1"
 
 source = {
   url = "git+https://github.com/azratul/punch.lua.git",
-  tag = "v0.3.1"
+  tag = "v0.3.2"
 }
 
 description = {
