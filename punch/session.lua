@@ -335,10 +335,16 @@ function M.new(config)
 		self._winning_pair = winning_pair
 		local key = config.key or _derive_session_key(self)
 
+		local peer_addr = winning_pair.learned_addr or winning_pair.remote_cand.addr
+		local peer_port = winning_pair.learned_port or winning_pair.remote_cand.port
+		if winning_pair.learned_addr then
+			log.debug("using learned peer address: %s:%d", peer_addr, peer_port)
+		end
+
 		local ch = channel.new_udp(
 			handle,
-			winning_pair.remote_cand.addr,
-			winning_pair.remote_cand.port,
+			peer_addr,
+			peer_port,
 			{
 				key = key,
 				mode = "direct",
@@ -365,6 +371,7 @@ function M.new(config)
 
 	-- Helper: attempt relay fallback after all direct pairs fail.
 	function self:_try_relay(direct_err)
+		log.debug("direct hole punching failed: %s; attempting relay fallback", tostring(direct_err))
 		local relay_url = config.relay
 		-- relay_is_consumer: this peer connects to the remote's relay broker, so use the
 		-- remote description's relay_token (the broker owner's token) as the room key.

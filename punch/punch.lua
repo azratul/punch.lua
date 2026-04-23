@@ -88,7 +88,7 @@ function M.probe(handle, remote_addr, remote_port, opts, callback)
   local done        = false
   local timers      = {}
 
-  local function finish(err)
+  local function finish(err, learned_addr, learned_port)
     if done then return end
     done = true
     for _, t in ipairs(timers) do
@@ -96,14 +96,18 @@ function M.probe(handle, remote_addr, remote_port, opts, callback)
     end
     -- We don't recv_stop here because the caller (channel.lua)
     -- will want to start its own recv_start.
-    callback(err, err == nil and handle or nil)
+    callback(err, err == nil and handle or nil, learned_addr, learned_port)
   end
+
+  local sent_txids = {}
 
   local function send_probe()
     if done then return end
-    log.debug("sending UDP probe to %s:%d", remote_addr, remote_port)
+    local txid = new_txid()
+    sent_txids[txid] = true
+    log.debug("sending UDP probe to %s:%d (txid: %s)", remote_addr, remote_port, txid:gsub(".", function(c) return string.format("%02x", c:byte()) end))
     handle:send(
-      build_binding_request(new_txid()),
+      build_binding_request(txid),
       remote_addr, remote_port,
       function(err)
         if err then log.debug("UDP send error: %s", tostring(err)) end
@@ -119,25 +123,38 @@ function M.probe(handle, remote_addr, remote_port, opts, callback)
     local src_port = addr_tab and addr_tab.port
 
     if src_addr then
+      src_addr = src_addr:gsub("^::ffff:", "")
       log.debug("packet received from %s:%d (%d bytes)", src_addr, src_port or 0, #data)
     end
 
-    -- Respond to Binding Requests so the remote can confirm their side.
-    -- Receiving a Request only proves remote→us; do NOT finish here.
+    -- 1. STUN Binding Request: Respond (courtesy) so the remote can confirm their side.
+    -- Receiving a Request proves remote→us, but not necessarily us→remote.
     if src_addr and is_stun(data) and unpack16(data, 1) == 0x0001 then
-      local resp = build_response(data:sub(9, 20), src_addr, src_port)
+      local txid = data:sub(9, 20)
+      log.debug("received Binding Request (txid: %s) from %s:%d", txid:gsub(".", function(c) return string.format("%02x", c:byte()) end), src_addr, src_port)
+      local resp = build_response(txid, src_addr, src_port)
       if resp then
         handle:send(resp, src_addr, src_port, function() end)
       end
       return
     end
 
-    -- A Binding Response (or any non-Request datagram) from the remote proves
-    -- bidirectionality: our probe reached them and their reply reached us.
+    -- 2. STUN Binding Response: If TXID matches one of ours, it proves bidirectionality.
+    -- We accept it even if src_addr != remote_addr (peer-reflexive candidate).
+    if src_addr and is_stun(data) and unpack16(data, 1) == 0x0101 then
+      local txid = data:sub(9, 20)
+      if sent_txids[txid] then
+        log.debug("hole punched — bidirectional confirmation (STUN response) from %s:%d (matches txid)", src_addr, src_port)
+        schedule(function() finish(nil, src_addr, src_port) end)
+        return
+      end
+    end
+
+    -- 3. Legacy/Direct match: Any non-STUN packet or response from the exact remote_addr.
     local clean_src = src_addr and src_addr:gsub("^::ffff:", "")
-    if not clean_src or clean_src == remote_addr then
-      log.debug("hole punched — bidirectional confirmation from %s", remote_addr)
-      schedule(function() finish(nil) end)
+    if clean_src and clean_src == remote_addr then
+      log.debug("hole punched — direct confirmation from %s:%d", src_addr, src_port)
+      schedule(function() finish(nil, src_addr, src_port) end)
     end
   end)
 

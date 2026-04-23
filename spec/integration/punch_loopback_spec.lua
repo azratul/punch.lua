@@ -172,4 +172,63 @@ describe("punch loopback", function()
     end
   end)
 
+  -- ── Peer-reflexive learning (TXID matching) ───────────────────────────────
+
+  it("accepts STUN response from a different port if TXID matches (peer-reflexive)", function()
+    local result_addr, result_port, portC
+
+    local ok = run_loop(2000, function(cancel)
+      local hA = uv.new_udp()
+      local hB = uv.new_udp() -- The "legit" remote we are probing
+      local hC = uv.new_udp() -- The "surprise" remote that sends the response
+      
+      assert(hA:bind("127.0.0.1", 0))
+      assert(hB:bind("127.0.0.1", 0))
+      assert(hC:bind("127.0.0.1", 0))
+
+      local portA = hA:getsockname().port
+      local portB = hB:getsockname().port
+      portC = hC:getsockname().port
+
+      hB:recv_start(function(err, data, addr)
+        if data and #data >= 20 then
+          local txid = data:sub(9, 20)
+          
+          -- Build a STUN response manually
+          local stun = require("punch.stun")
+          local bit = require("bit")
+          local pack16 = stun._pack16
+          local pack32 = stun._pack32
+          local MAGIC = stun._MAGIC
+          local MAGIC_HI = stun._MAGIC_HI
+          
+          local ip = addr.address or addr.ip
+          local a, b, c, d = ip:match("(%d+)%.(%d+)%.(%d+)%.(%d+)")
+          local ip32 = tonumber(a)*16777216 + tonumber(b)*65536 + tonumber(c)*256 + tonumber(d)
+          local xport = bit.bxor(portA, MAGIC_HI)
+          local xaddr = bit.bxor(ip32, MAGIC)
+          local attr = pack16(0x0020) .. pack16(8) .. "\x00\x01" .. pack16(xport) .. pack32(xaddr)
+          local resp = pack16(0x0101) .. pack16(#attr) .. pack32(MAGIC) .. txid .. attr
+          
+          -- Send from hC (different port!)
+          hC:send(resp, "127.0.0.1", portA, function() end)
+        end
+      end)
+
+      punch.probe(hA, "127.0.0.1", portB, { interval = 50, timeout = 1000 },
+        function(err, handle, learned_addr, learned_port)
+          result_addr = learned_addr
+          result_port = learned_port
+          safe_close(hA)
+          safe_close(hB)
+          safe_close(hC)
+          cancel()
+        end)
+    end)
+
+    assert.is_true(ok, "test exceeded budget")
+    assert.equal("127.0.0.1", result_addr)
+    assert.equal(portC, result_port, "should have learned the port of the socket that actually sent the response")
+  end)
+
 end)

@@ -53,6 +53,7 @@ local M = {}
 
 local uv     = (vim and (vim.uv or vim.loop)) or require("luv")
 local crypto = require("punch.crypto")
+local log    = require("punch.log")
 local schedule = (vim and vim.schedule) or function(fn) fn() end
 
 local MAX_PAYLOAD        = 65000  -- bytes; guard against accidental misuse
@@ -180,11 +181,14 @@ function M.new_udp(handle, peer_addr, peer_port, opts)
     if not data then return end
 
     -- Only accept traffic from the known peer.
-    local src_addr = addr_tab and addr_tab.address
+    local src_addr = addr_tab and (addr_tab.address or addr_tab.ip)
     if src_addr then
       src_addr = src_addr:gsub("^::ffff:", "")
-      if src_addr ~= peer_addr then return end
     end
+
+    -- If unencrypted, we MUST match the known peer address.
+    -- If encrypted, we allow any source if it decrypts successfully (below).
+    if not key and src_addr ~= peer_addr then return end
 
     -- Any packet from peer resets the dead-peer clock.
     self._last_recv = uv.now()
@@ -193,6 +197,17 @@ function M.new_udp(handle, peer_addr, peer_port, opts)
     if key then
       local dec = crypto.decrypt(key, data)
       if not dec then return end  -- bad tag: drop silently (stray / replay)
+      
+      -- If decryption succeeds, this IS our peer. If their IP changed
+      -- (e.g. peer-reflexive candidate learned during probe, or roaming),
+      -- we update our local state so we send replies to the right place.
+      if src_addr and (src_addr ~= peer_addr or (addr_tab and addr_tab.port ~= peer_port)) then
+        log.debug("peer address updated to %s:%d (validated via AES-GCM)", src_addr, addr_tab.port)
+        peer_addr = src_addr
+        peer_port = addr_tab.port
+        self.peer_addr = src_addr
+        self.peer_port = addr_tab.port
+      end
       payload = dec
     end
 

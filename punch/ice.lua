@@ -62,19 +62,24 @@ local function get_lan_ip()
   end
 
   local fallback
+  local virtual_fallback
   for name, addrs in pairs(ifaces) do
     for _, addr in ipairs(addrs) do
       local ip = addr.ip or addr.address  -- luv uses .ip, vim.uv uses .address
       if ip and (addr.family == "inet" or addr.family == "IPv4") and not addr.internal then
-        if is_rfc1918(ip) and not is_virtual(name) then
-          return ip  -- best match: physical interface with private range IP
+        if is_rfc1918(ip) then
+          if not is_virtual(name) then
+            return ip  -- best match: physical interface with private range IP
+          else
+            virtual_fallback = virtual_fallback or ip
+          end
         end
         fallback = fallback or ip  -- keep as fallback if nothing better found
       end
     end
   end
 
-  return fallback or "127.0.0.1"
+  return virtual_fallback or fallback or "127.0.0.1"
 end
 
 -- ── Candidate priority (RFC 8445 §5.1.2) ─────────────────────────────────────
@@ -238,7 +243,7 @@ function M.check_pairs(pairs, handle, opts, callback)
     pair.state = "in_progress"
 
     punch.probe(handle, pair.remote_cand.addr, pair.remote_cand.port, opts,
-      function(err, h)
+      function(err, h, learned_addr, learned_port)
         if done then return end
         if err then
           pair.state = "failed"
@@ -246,6 +251,8 @@ function M.check_pairs(pairs, handle, opts, callback)
         else
           done = true
           pair.state = "succeeded"
+          pair.learned_addr = learned_addr
+          pair.learned_port = learned_port
           callback(nil, pair, h)
         end
       end)
