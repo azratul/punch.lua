@@ -115,7 +115,7 @@ function M.probe(handle, remote_addr, remote_port, opts, callback)
     if done then return end
     if recv_err or not data then return end
     
-    local src_addr = addr_tab and addr_tab.address
+    local src_addr = addr_tab and (addr_tab.address or addr_tab.ip)
     local src_port = addr_tab and addr_tab.port
 
     if src_addr then
