@@ -123,18 +123,20 @@ function M.probe(handle, remote_addr, remote_port, opts, callback)
     end
 
     -- Respond to Binding Requests so the remote can confirm their side.
+    -- Receiving a Request only proves remote→us; do NOT finish here.
     if src_addr and is_stun(data) and unpack16(data, 1) == 0x0001 then
       local resp = build_response(data:sub(9, 20), src_addr, src_port)
       if resp then
         handle:send(resp, src_addr, src_port, function() end)
       end
+      return
     end
 
-    -- Any datagram from the target remote means the hole is punched.
-    -- In local tests (127.0.0.1), some systems report '::ffff:127.0.0.1' or similar.
+    -- A Binding Response (or any non-Request datagram) from the remote proves
+    -- bidirectionality: our probe reached them and their reply reached us.
     local clean_src = src_addr and src_addr:gsub("^::ffff:", "")
     if not clean_src or clean_src == remote_addr then
-      log.debug("hole punched — connection established with %s", remote_addr)
+      log.debug("hole punched — bidirectional confirmation from %s", remote_addr)
       schedule(function() finish(nil) end)
     end
   end)
