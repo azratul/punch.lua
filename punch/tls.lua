@@ -45,6 +45,7 @@ if ffi_ok then
       void  SSL_set_bio(SSL *s, BIO *rbio, BIO *wbio);
       void  SSL_set_connect_state(SSL *s);
       long  SSL_ctrl(SSL *ssl, int cmd, long larg, void *parg);
+      int   SSL_CTX_set_alpn_protos(SSL_CTX *ctx, const unsigned char *protos, unsigned int protos_len);
       int   SSL_do_handshake(SSL *s);
       int   SSL_get_error(SSL *s, int ret);
       int   SSL_write(SSL *s, const void *buf, int num);
@@ -88,6 +89,10 @@ function M.wrap(tcp, host, callback)
     callback("SSL_CTX_new failed")
     return
   end
+
+  -- Force HTTP/1.1 via ALPN so proxies like localhost.run don't negotiate HTTP/2.
+  local alpn = "\x08http/1.1"
+  ssl_lib.SSL_CTX_set_alpn_protos(ctx, alpn, #alpn)
 
   local ssl = ssl_lib.SSL_new(ctx)
   ssl_lib.SSL_CTX_free(ctx) -- SSL holds its own reference

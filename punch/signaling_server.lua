@@ -327,16 +327,40 @@ local function parse_http_head(buf)
 end
 
 -- Parse HTTP response status + headers from a buffer.
--- Returns status_code, x_slot, content_length, body_start  or  nil.
+-- Returns status_code, x_slot, content_length, body_start, chunked  or  nil.
 local function parse_http_response(buf)
   local hdr_end = buf:find("\r\n\r\n", 1, true)
   if not hdr_end then return nil end
   local head  = buf:sub(1, hdr_end - 1)
   local code  = tonumber(head:match("^HTTP/%d+%.%d+ (%d+)"))
   if not code then return nil end
-  local slot  = head:match("[Xx]%-[Ss]lot: *([%x]+)")
-  local clen  = tonumber(head:match("[Cc]ontent%-[Ll]ength: *(%d+)")) or 0
-  return code, slot, clen, hdr_end + 4
+  local slot    = head:match("[Xx]%-[Ss]lot: *([%x]+)")
+  local clen    = tonumber(head:match("[Cc]ontent%-[Ll]ength: *(%d+)"))
+  local chunked = head:lower():find("transfer%-encoding:%s*chunked", 1, false) ~= nil
+  return code, slot, clen, hdr_end + 4, chunked
+end
+
+-- Decode a chunked body from a buffer starting at body_off.
+-- Returns the decoded body string, or nil if the chunks are not yet complete.
+local function decode_chunked(buf, body_off)
+  local body = buf:sub(body_off)
+  local out   = {}
+  local i     = 1
+  while i <= #body do
+    local lf = body:find("\r\n", i, true)
+    if not lf then return nil end
+    -- Chunk size line may include extensions ("N;ext=val"), strip them.
+    local sz_str = body:sub(i, lf - 1):match("^%s*([%x]+)")
+    local sz = sz_str and tonumber(sz_str, 16)
+    if not sz then return nil end
+    if sz == 0 then break end
+    local data_start = lf + 2
+    local data_end   = data_start + sz - 1
+    if data_end > #body then return nil end
+    out[#out + 1] = body:sub(data_start, data_end)
+    i = data_end + 3  -- skip \r\n after chunk data
+  end
+  return table.concat(out)
 end
 
 local STATUS = { [200]="OK", [404]="Not Found", [405]="Method Not Allowed",
@@ -626,13 +650,22 @@ local function http_req(method, url, path, body, timeout_ms, callback)
       end
 
       buf = buf .. data
-      local code, slot, clen, body_off = parse_http_response(buf)
+      local code, slot, clen, body_off, chunked = parse_http_response(buf)
       if not code then return end
-      if #buf < body_off + clen - 1 then return end
+
+      local resp
+      if chunked then
+        resp = decode_chunked(buf, body_off)
+        if resp == nil then return end  -- chunks not yet complete
+      elseif clen and clen > 0 then
+        if #buf < body_off + clen - 1 then return end
+        resp = buf:sub(body_off, body_off + clen - 1)
+      else
+        resp = ""
+      end
 
       io:read_stop()
       io:close()
-      local resp = clen > 0 and buf:sub(body_off, body_off + clen - 1) or ""
       finish(nil, code, slot, resp)
     end)
 
