@@ -11,7 +11,7 @@ Designed for LuaJIT scripts, automation tools, or **Neovim** plugins requiring s
 - **NAT Traversal**: Coordinated UDP hole punching via STUN (RFC 5389) and ICE-lite candidate logic.
 - **Security**: End-to-end encrypted channels using **AES-256-GCM** + **X25519 ECDH** key exchange (via OpenSSL FFI). No pre-shared key required.
 - **Resilience**: Automatic fallback to a **WebSocket relay broker** when symmetric NATs block direct traversal. UDP keepalives + dead-peer detection.
-- **HTTP Signaling**: Optional built-in local HTTP signaling server — expose it with ngrok for internet-wide rendezvous without a separate backend.
+- **HTTP Signaling**: Optional built-in local HTTP signaling server — expose it with ngrok, bore, or localhost.run for internet-wide rendezvous without a separate backend. HTTPS tunnels are supported transparently (requires OpenSSL).
 - **Asynchronous**: Non-blocking I/O via `luv` (libuv). Works with `vim.uv`/`vim.loop` (Neovim ≥ 0.10) or standalone `luv`.
 
 ## Installation
@@ -124,7 +124,7 @@ sig.fetch_host("https://xxxx.ngrok-free.app", 60000, function(err, host_desc, sl
 end)
 ```
 
-HTTPS is handled transparently when the URL scheme is `https://` (requires OpenSSL).
+HTTPS is handled transparently when the URL scheme is `https://` (requires OpenSSL). The TLS client negotiates `http/1.1` via ALPN so HTTPS reverse proxies (nginx, localhost.run, etc.) do not upgrade to HTTP/2, which would break both the long-poll and the WebSocket relay upgrade.
 
 ### Relay fallback
 
@@ -153,7 +153,7 @@ See `docs/broker.md` for a reference broker implementation (~60 lines of Node.js
 | `punch/crypto.lua` | AES-256-GCM + X25519 via LuaJIT FFI → OpenSSL |
 | `punch/relay.lua` | WebSocket relay fallback |
 | `punch/ws.lua` | Minimal WebSocket client (text + binary), optional TLS |
-| `punch/tls.lua` | TLS wrapper over a `uv` TCP handle using OpenSSL memory BIOs |
+| `punch/tls.lua` | TLS wrapper over a `uv` TCP handle using OpenSSL memory BIOs; negotiates `http/1.1` via ALPN |
 | `punch/signaling_server.lua` | Local HTTP signaling server + HTTPS client helpers |
 | `punch/log.lua` | Structured debug logging to file |
 
